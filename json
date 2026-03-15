@@ -1,0 +1,49 @@
+
+import json
+import random
+import os
+import mysql.connector
+
+
+conn = mysql.connector.connect(
+    host="127.0.0.1",
+    port=3306,
+    user="root",
+    password="MySQL_Student123",
+    database="support_db"
+)
+cursor = conn.cursor()
+cursor.execute("SELECT call_id FROM calls")
+call_ids = [row[0] for row in cursor.fetchall()]
+cursor.close()
+conn.close()
+
+
+output_dir = os.path.dirname(os.path.abspath(__file__))
+
+
+descriptions = [
+    "Customer called regarding billing issue. Agent reviewed account and applied correction.",
+    "Inbound call about service outage. Ticket #{} created and escalated to technical team.",
+    "Customer requested account password reset. Verification completed successfully.",
+    "Call regarding delayed shipment. Tracking number provided, delivery date confirmed.",
+    "Technical support call for connectivity issues. Remote diagnostics performed, resolved.",
+    "Customer inquiry about subscription upgrade. Options explained, upgrade processed.",
+    "Complaint about incorrect charge. Refund initiated, confirmation sent via email.",
+    "Outbound follow-up call after previous ticket. Customer confirmed issue is resolved.",
+]
+
+
+for call_id in call_ids:
+    record = {
+        "call_id": call_id,
+        "duration_sec": random.randint(30, 900),
+        "short_description": random.choice(descriptions).format(
+            random.randint(1000, 9999)
+        )
+    }
+    filepath = os.path.join(output_dir, f"call_{call_id}.json")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+
+print(f"✅ Generated {len(call_ids)} JSON files in '{output_dir}/'")
