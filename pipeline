@@ -1,0 +1,248 @@
+
+import json
+import os
+import logging
+from datetime import datetime, timedelta
+
+import duckdb
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+
+DUCKDB_PATH      = "/opt/airflow/duckdb/warehouse.duckdb"
+TELEPHONY_DIR    = "/opt/airflow/data/telephony"
+MYSQL_CONN_ID    = "mysql_support"
+WATERMARK_KEY    = "last_loaded_call_time"
+WATERMARK_DEFAULT = "2000-01-01 00:00:00"
+
+
+def detect_new_calls(**context):
+   
+    last_loaded = Variable.get(WATERMARK_KEY, default_var=WATERMARK_DEFAULT)
+    logging.info(f"Watermark: {last_loaded}")
+
+    hook = MySqlHook(mysql_conn_id=MYSQL_CONN_ID)
+    sql = """
+        SELECT call_id, employee_id, call_time, phone, direction, status
+        FROM calls
+        WHERE call_time > %s
+        ORDER BY call_time ASC
+    """
+    rows = hook.get_records(sql, parameters=[last_loaded])
+
+    if not rows:
+        logging.info("No new calls found")
+        context["ti"].xcom_push(key="new_calls", value=[])
+        context["ti"].xcom_push(key="new_call_ids", value=[])
+        return
+
+
+    new_calls = []
+    for row in rows:
+        new_calls.append({
+            "call_id":     row[0],
+            "employee_id": row[1],
+            "call_time":   str(row[2]),
+            "phone":       row[3],
+            "direction":   row[4],
+            "status":      row[5],
+        })
+
+    call_ids = [c["call_id"] for c in new_calls]
+    logging.info(f"Found {len(new_calls)} new calls: {call_ids}")
+
+
+    context["ti"].xcom_push(key="new_calls", value=new_calls)
+    context["ti"].xcom_push(key="new_call_ids", value=call_ids)
+
+
+def load_telephony_details(**context):
+    call_ids = context["ti"].xcom_pull(
+        task_ids="detect_new_calls",
+        key="new_call_ids"
+    )
+
+    if not call_ids:
+        logging.info("No call_ids to process")
+        context["ti"].xcom_push(key="telephony_records", value=[])
+        return
+
+    valid_records = []
+    rejected_count = 0
+    required_fields = {"call_id", "duration_sec", "short_description"}
+
+    for call_id in call_ids:
+        filepath = os.path.join(TELEPHONY_DIR, f"call_{call_id}.json")
+
+
+        if not os.path.exists(filepath):
+            logging.warning(f"[MISSING] No JSON for call_id={call_id}")
+            rejected_count += 1
+            continue
+
+
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            logging.error(f"[INVALID JSON] call_id={call_id}: {e}")
+            rejected_count += 1
+            continue
+
+
+        missing = required_fields - data.keys()
+        if missing:
+            logging.error(f"[MISSING FIELDS] call_id={call_id}: {missing}")
+            rejected_count += 1
+            continue
+
+
+        if not isinstance(data["duration_sec"], (int, float)) or data["duration_sec"] < 0:
+            logging.error(f"[INVALID VALUE] call_id={call_id}: duration_sec={data['duration_sec']}")
+            rejected_count += 1
+            continue
+
+        valid_records.append(data)
+
+    logging.info(f"Telephony loaded: {len(valid_records)} valid, {rejected_count} rejected")
+    context["ti"].xcom_push(key="telephony_records", value=valid_records)
+
+
+
+def transform_and_load_duckdb(**context):
+    new_calls = context["ti"].xcom_pull(
+        task_ids="detect_new_calls",
+        key="new_calls"
+    )
+    telephony_records = context["ti"].xcom_pull(
+        task_ids="load_telephony_details",
+        key="telephony_records"
+    )
+
+    if not new_calls:
+        logging.info("Nothing to load into DuckDB")
+        return
+
+   
+    telephony_map = {r["call_id"]: r for r in telephony_records}
+
+    hook = MySqlHook(mysql_conn_id=MYSQL_CONN_ID)
+    emp_rows = hook.get_records("SELECT employee_id, full_name, team, role FROM employees")
+    employees_map = {
+        row[0]: {"full_name": row[1], "team": row[2], "role": row[3]}
+        for row in emp_rows
+    }
+
+
+    con = duckdb.connect(DUCKDB_PATH)
+
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS support_call_enriched (
+            call_id           INTEGER PRIMARY KEY,
+            employee_id       INTEGER,
+            full_name         VARCHAR,
+            team              VARCHAR,
+            role              VARCHAR,
+            call_time         TIMESTAMP,
+            phone             VARCHAR,
+            direction         VARCHAR,
+            status            VARCHAR,
+            duration_sec      INTEGER,
+            short_description VARCHAR,
+            loaded_at         TIMESTAMP
+        )
+    """)
+
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_metadata (
+            key   VARCHAR PRIMARY KEY,
+            value VARCHAR
+        )
+    """)
+
+   
+    inserted = 0
+    max_call_time = None
+
+    for call in new_calls:
+        call_id     = call["call_id"]
+        employee_id = call["employee_id"]
+        call_time   = call["call_time"]
+
+
+        tel = telephony_map.get(call_id, {})
+        duration_sec      = tel.get("duration_sec", None)
+        short_description = tel.get("short_description", None)
+
+
+        emp = employees_map.get(employee_id, {})
+        full_name = emp.get("full_name", "Unknown")
+        team      = emp.get("team", "Unknown")
+        role      = emp.get("role", "Unknown")
+
+        con.execute("""
+            INSERT OR REPLACE INTO support_call_enriched
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            call_id, employee_id, full_name, team, role,
+            call_time, call["phone"], call["direction"], call["status"],
+            duration_sec, short_description,
+            datetime.now().isoformat()
+        ])
+        inserted += 1
+
+
+        if max_call_time is None or call_time > max_call_time:
+            max_call_time = call_time
+
+    logging.info(f"Inserted {inserted} rows into DuckDB")
+
+    # Оновлюємо watermark тільки після успішного запису
+    if max_call_time:
+        Variable.set(WATERMARK_KEY, str(max_call_time))
+        con.execute("""
+            INSERT OR REPLACE INTO pipeline_metadata VALUES ('last_loaded_call_time', ?)
+        """, [str(max_call_time)])
+        logging.info(f"Watermark updated to: {max_call_time}")
+
+    con.close()
+
+
+default_args = {
+    "owner":            "airflow",
+    "retries":          2,
+    "retry_delay":      timedelta(minutes=5),
+    "email_on_failure": False,
+}
+
+with DAG(
+    dag_id="support_call_enrichment",
+    default_args=default_args,
+    description="Hourly support call enrichment pipeline",
+    schedule_interval="0 * * * *",   
+    start_date=datetime(2025, 1, 1),
+    catchup=False,
+    tags=["support", "enrichment"],
+) as dag:
+
+    task1 = PythonOperator(
+        task_id="detect_new_calls",
+        python_callable=detect_new_calls,
+    )
+
+    task2 = PythonOperator(
+        task_id="load_telephony_details",
+        python_callable=load_telephony_details,
+    )
+
+    task3 = PythonOperator(
+        task_id="transform_and_load_duckdb",
+        python_callable=transform_and_load_duckdb,
+    )
+
+
+    task1 >> task2 >> task3
