@@ -1,0 +1,30 @@
+USE support_db;
+
+DROP TABLE IF EXISTS calls;
+DROP TABLE IF EXISTS employees;
+
+
+CREATE TABLE employees (
+    employee_id INT          PRIMARY KEY AUTO_INCREMENT,
+    full_name   VARCHAR(100) NOT NULL,
+    team        VARCHAR(50)  NOT NULL,
+    role        VARCHAR(50)  NOT NULL,
+    hire_date   DATE         NOT NULL
+);
+
+CREATE TABLE calls (
+    call_id     INT          PRIMARY KEY AUTO_INCREMENT,
+    employee_id INT          NOT NULL,
+    call_time   DATETIME     NOT NULL,
+    phone       VARCHAR(20)  NOT NULL,
+    direction   ENUM('inbound', 'outbound')            NOT NULL,
+    status      ENUM('answered', 'missed', 'voicemail') NOT NULL,
+    FOREIGN KEY (employee_id) REFERENCES employees(employee_id)
+);
+
+
+
+
+USE support_db;
+SELECT COUNT(*) FROM employees;
+SELECT * FROM calls;
